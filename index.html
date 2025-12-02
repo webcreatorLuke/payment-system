@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Secure Checkout (Self-Hosted)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+    .row { margin-bottom: 12px; }
+    label { display: block; font-weight: 600; margin-bottom: 4px; }
+    input, button { padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; width: 100%; }
+    button { border: none; background: #111827; color: #fff; cursor: pointer; width: auto; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .notice { font-size: 12px; color: #6b7280; }
+    #message { margin-top: 12px; min-height: 20px; }
+    iframe { width: 100%; height: 180px; border: 1px solid #e5e7eb; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Checkout</h1>
+
+  <!-- Auth -->
+  <div class="card">
+    <div class="row">
+      <label>Email</label>
+      <input id="email" type="email" placeholder="you@example.com" />
+    </div>
+    <div class="row">
+      <label>Password</label>
+      <input id="password" type="password" placeholder="••••••••" />
+    </div>
+    <div class="row" style="display:flex; gap:8px;">
+      <button id="signup">Sign up</button>
+      <button id="login">Log in</button>
+    </div>
+    <div class="notice">Owner is free. Use the email configured as OWNER_EMAIL on the server.</div>
+    <div id="authStatus"></div>
+  </div>
+
+  <!-- Payment -->
+  <div class="card">
+    <div class="row">
+      <label>Amount (USD cents)</label>
+      <input id="amount" type="number" value="2500" min="50" />
+    </div>
+
+    <div class="row">
+      <label>Payment details</label>
+      <!-- Hosted fields iframe (served by backend) -->
+      <iframe id="hostedFields" src="http://localhost:4242/hosted/fields" sandbox="allow-scripts allow-same-origin"></iframe>
+    </div>
+
+    <div class="row" style="display:flex; gap:8px;">
+      <button id="authorize" disabled>Authorize</button>
+      <button id="capture" disabled>Capture</button>
+      <button id="refund" disabled>Refund</button>
+    </div>
+
+    <div class="notice">
+      Card inputs run in a secure iframe. The checkout page only receives a token (no raw card data).
+    </div>
+
+    <div id="message"></div>
+  </div>
+
+  <script>
+    const API_BASE = "http://localhost:4242";
+    let token = null;
+    let paymentToken = null;
+    let authId = null;
+
+    const el = (id) => document.getElementById(id);
+    const setMsg = (m, ok=true) => {
+      el('message').textContent = m;
+      el('message').style.color = ok ? '#111827' : '#b91c1c';
+    };
+
+    async function signup() {
+      const res = await fetch(`${API_BASE}/auth/signup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: el('email').value, password: el('password').value })
+      });
+      const data = await res.json();
+      el('authStatus').textContent = res.ok ? 'Signed up. Log in now.' : (data.error || 'Signup failed');
+    }
+
+    async function login() {
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: el('email').value, password: el('password').value })
+      });
+      const data = await res.json();
+      if (!res.ok) { el('authStatus').textContent = data.error || 'Login failed'; return; }
+      token = data.token;
+      el('authStatus').textContent = `Logged in as ${data.user.email} (role: ${data.user.role}).`;
+      el('authorize').disabled = false;
+      // Initialize communication with hosted fields
+      setupHostedFields();
+    }
+
+    function setupHostedFields() {
+      // Request a vaulted token from the iframe when ready
+      window.addEventListener('message', async (evt) => {
+        if (evt.origin !== API_BASE) return;
+        const { type, payload } = evt.data || {};
+        if (type === 'vaultedToken') {
+          paymentToken = payload.token;
+          setMsg(`Payment token ready: ${paymentToken.slice(0, 8)}…`);
+        } else if (type === 'hostedReady') {
+          // Ask iframe to tokenize current inputs
+          el('hostedFields').contentWindow.postMessage({ type: 'tokenize' }, API_BASE);
+        } else if (type === 'error') {
+          setMsg(payload.message || 'Hosted fields error', false);
+        }
+      });
+    }
+
+    async function authorize() {
+      if (!token) return setMsg('Log in first', false);
+      if (!paymentToken) return setMsg('Payment token not ready', false);
+      el('authorize').disabled = true;
+      const res = await fetch(`${API_BASE}/payments/authorize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ amount: parseInt(el('amount').value, 10), paymentToken })
+      });
+      const data = await res.json();
+      if (!res.ok) { setMsg(data.error || 'Authorization failed', false); el('authorize').disabled = false; return; }
+      authId = data.authorizationId;
+      el('capture').disabled = false;
+      el('refund').disabled = false;
+      setMsg(`Authorized ${data.amount} cents. Auth ID: ${authId}. Fee: ${data.fee} cents.`);
+    }
+
+    async function capture() {
+      if (!authId) return setMsg('No authorization to capture', false);
+      el('capture').disabled = true;
+      const res = await fetch(`${API_BASE}/payments/capture`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ authorizationId: authId })
+      });
+      const data = await res.json();
+      if (!res.ok) { setMsg(data.error || 'Capture failed', false); el('capture').disabled = false; return; }
+      setMsg(`Captured. Transaction ID: ${data.transactionId}. Settled: ${data.settled}`);
+    }
+
+    async function refund() {
+      if (!authId) return setMsg('No authorization to refund', false);
+      el('refund').disabled = true;
+      const res = await fetch(`${API_BASE}/payments/refund`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ authorizationId: authId })
+      });
+      const data = await res.json();
+      if (!res.ok) { setMsg(data.error || 'Refund failed', false); el('refund').disabled = false; return; }
+      setMsg(`Refunded. Refund ID: ${data.refundId}`);
+    }
+
+    el('signup').addEventListener('click', signup);
+    el('login').addEventListener('click', login);
+    el('authorize').addEventListener('click', authorize);
+    el('capture').addEventListener('click', capture);
+    el('refund').addEventListener('click', refund);
+  </script>
+</body>
+</html>
